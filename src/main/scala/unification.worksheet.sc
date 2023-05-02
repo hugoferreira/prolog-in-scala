@@ -3,158 +3,188 @@ sealed trait Term {
 }
 
 case class Atom(name: String) extends Term
-case class Variable(name: String) extends Term
+case class Variable(name: String, var clause: Option[Clause] = None) extends Term {
+  override def toString(): String = s"Variable($name, ${clause.map(_.name).getOrElse("None")})"
+}
+
 case class Compound(functor: String, arguments: Term*) extends Term {
   override val arity = arguments.length
 }
 
-case class Fact(functor: String, arguments: Term*) {
-  val arity = arguments.length
-}
-
-// TODO Change Rule to have a head and a body, since the head is a mandatory part of a rule
-case class Rule(head: Compound, body: Compound*) {
+case class Clause(head: Compound, body: List[Compound]) {
   val arity = body.length
+  val name = head.functor
 }
 
-def unify(term1: Term, term2: Term): Option[Map[String, Term]] = (term1, term2) match {
-  case (Atom(name1), Atom(name2)) if name1 == name2 => Some(Map.empty[String, Term])
-  case (Variable(name1), Variable(name2)) if name1 == name2 => Some(Map.empty[String, Term])
-  case (v: Variable, _) => Some(Map(v.name -> term2))
-  case (_, v: Variable) => Some(Map(v.name -> term1))
-  case (Compound(functor1, args1*), Compound(functor2, args2*))
-  if functor1 == functor2 && term1.arity == term2.arity =>
-      unifyArgs(args1, args2, Map.empty[String, Term])
-  case _ => None
-}
+object Clause {
+  def rewriteVariableClause(compound: Compound, clause: Clause): Unit = {
+    compound.arguments.foreach {
+      case v: Variable => v.clause = Some(clause)
+      case _ => ()
+    }
+  }
+  
+  def fact(functor: String, arguments: Term*): Clause = {
+    Clause(Compound(functor, arguments: _*), List.empty)
+  }
 
-def unifyArgs(args1: Seq[Term], args2: Seq[Term], substitution: Map[String, Term]): Option[Map[String, Term]] = {
-  (args1, args2) match {
-    case (Nil, Nil) => Some(substitution)
-    case (arg1 +: rest1, arg2 +: rest2) =>
-      unify(arg1, arg2) match {
-        case Some(subst) =>
-          val newSubstitution = substitution ++ subst
-          unifyArgs(rest1, rest2, newSubstitution)
-        case None => None
-      }
-    case _ => None
+  def rule(head: Compound, body: Compound*): Clause = {
+    val clause = Clause(head, body.toList)
+    rewriteVariableClause(head, clause)
+    body.foreach { c => rewriteVariableClause(c, clause) }
+    clause
+  }
+
+  def compound(functor: String, arguments: String*): Compound = {
+    Compound(functor, arguments.map(_ match {
+      case s if s.head.isUpper => Variable(s)
+      case s => Atom(s)
+    }): _*)
   }
 }
 
-def applySubstitution(term: Term, substitution: Map[String, Term]): Term = term match {
-  case atom: Atom => atom
-  case variable: Variable => substitution.getOrElse(variable.name, variable)
-  case compound: Compound => 
-    Compound(compound.functor, compound.arguments.map(arg => applySubstitution(arg, substitution)): _*)
+object BuiltInPredicates {
+  def not_equal(using substitution: Map[Variable, Term])(arg1: Term, arg2: Term): Option[Map[Variable, Term]] = {
+    InferenceEngine.applySubstitution(arg1) != InferenceEngine.applySubstitution(arg2) match {
+      case true => Some(substitution)
+      case false => None
+    }
+  }
 }
+
+object InferenceEngine {
+  def unify(term1: Term, term2: Term): Option[Map[Variable, Term]] = (term1, term2) match {
+    case (Atom(name1), Atom(name2)) if name1 == name2 => Some(Map.empty)
+    case (Variable(name1, clause1), Variable(name2, clause2)) if name1 == name2 && clause1 == clause2 => Some(Map.empty)
+    case (v: Variable, _) => Some(Map(v -> term2))
+    case (_, v: Variable) => Some(Map(v -> term1))
+    case (Compound(functor1, args1*), Compound(functor2, args2*))
+      if functor1 == functor2 && term1.arity == term2.arity =>
+        unifyArgs(args1, args2, Map.empty)
+    case _ => None
+  }
+
+  def unifyArgs(args1: Seq[Term], args2: Seq[Term], substitution: Map[Variable, Term]): Option[Map[Variable, Term]] = {
+    (args1, args2) match {
+      case (Nil, Nil) => Some(substitution)
+      case (arg1 +: rest1, arg2 +: rest2) =>
+        unify(arg1, arg2) match {
+          case Some(subst) =>
+            unifyArgs(rest1, rest2, substitution ++ subst)
+          case None => None
+        }
+      case _ => None
+    }
+  }
+
+  def applySubstitution(using substitution: Map[Variable, Term])(term: Term): Term = term match {
+    case atom: Atom => atom
+    case variable: Variable => substitution.getOrElse(variable, variable)
+    case Compound(functor, arguments*) => 
+      Compound(functor, arguments.map(arg => applySubstitution(arg)): _*)
+  }
+
+  def search(using substitution: Map[Variable, Term])(goals: List[Compound], clauses: List[Clause]): LazyList[Map[Variable, Term]] = {
+    if (goals.isEmpty) return LazyList(substitution)
+
+    val (selectedGoal, remainingGoals) = (goals.head, goals.tail)
+
+    selectedGoal.functor match {
+      case "not_equal" => // Special functor handling
+        BuiltInPredicates.not_equal(selectedGoal.arguments(0), selectedGoal.arguments(1)) match {
+          case Some(newSubstitution) => search(using newSubstitution)(remainingGoals, clauses)
+          case None => LazyList.empty
+        }
+
+      case _ => // Regular case, unchanged from before
+        for {
+          clause <- clauses.to(LazyList)
+          unificationResult <- unify(selectedGoal, clause.head).to(LazyList)
+          newSubstitution = substitution ++ unificationResult
+          newGoals = applySubstitutionToCompounds(using newSubstitution)(remainingGoals)
+          result <- search(
+            newGoals ++ (if (clause.body.nonEmpty) applySubstitutionToCompounds(using unificationResult)(clause.body) else List.empty),
+            clauses
+          )
+        } yield result
+    }
+  }
+
+  def applySubstitutionToCompounds(using substitution: Map[Variable, Term])(compounds: List[Compound]): List[Compound] = {
+    compounds.map { compound => 
+      Compound(compound.functor, compound.arguments.map(arg => applySubstitution(arg)): _*) }
+  }
+
+  def chase(variable: Variable, substitution: Map[Variable, Term]): Term = {
+    substitution.get(variable) match {
+      case Some(v: Variable) => chase(v, substitution)
+      case Some(term) => term
+      case None => variable
+    }
+  }
+
+  def query(using substitution: Map[Variable, Term] = Map())(goal: Compound, clauses: List[Clause]): LazyList[Map[Variable, Term]] = {
+    val goals = List(goal)
+    val searchResults = search(goals, clauses)
+
+    searchResults.map { resultSubstitution =>
+      goal.arguments.collect {
+        case v: Variable => v -> chase(v, resultSubstitution)
+      }.toMap
+    }
+  }
+}
+
+import InferenceEngine._
 
 unify(Atom("a"), Atom("a")) == Some(Map.empty)
 unify(Atom("a"), Atom("b")) == None
-unify(Variable("X"), Atom("a")) == Some(Map("X" -> Atom("a")))
-unify(Atom("a"), Variable("X")) == Some(Map("X" -> Atom("a")))
+unify(Variable("X"), Atom("a")) == Some(Map(Variable("X") -> Atom("a")))
+unify(Atom("a"), Variable("X")) == Some(Map(Variable("X") -> Atom("a")))
 unify(Variable("X"), Variable("X")) == Some(Map.empty)
 unify(Compound("parent", Variable("X"), Compound("child", Atom("Alice"))),
       Compound("parent", Atom("john"), Compound("child", Atom("Alice"))))
-      == Some(Map("X" -> Atom("john")))
+      == Some(Map(Variable("X") -> Atom("john")))
 unify(Compound("parent", Variable("X"), Variable("Y")),
       Compound("parent", Atom("john"), Compound("child", Atom("Alice"))))
-      == Some(Map("X" -> Atom("john"), "Y" -> Compound("child", Atom("Alice"))))
+      == Some(Map(Variable("X") -> Atom("john"), Variable("Y") -> Compound("child", Atom("Alice"))))
 
-applySubstitution(Atom("a"), Map.empty) == Atom("a")
-applySubstitution(Variable("X"), Map.empty) == Variable("X")
-applySubstitution(Variable("X"), Map("X" -> Atom("a"))) == Atom("a")
-applySubstitution(Variable("X"), Map("Y" -> Atom("a"))) == Variable("X")
-applySubstitution(Compound("f", Atom("a"), Atom("b")), Map.empty) == Compound("f", Atom("a"), Atom("b"))
-applySubstitution(Compound("f", Variable("X"), Atom("b"), Variable("Y")), 
-                  Map("X" -> Atom("a"), "Y" -> Atom("c"))) 
+applySubstitution(using Map.empty)(Atom("a")) == Atom("a")
+applySubstitution(using Map.empty)(Variable("X")) == Variable("X")
+applySubstitution(using Map(Variable("X") -> Atom("a")))(Variable("X")) == Atom("a")
+applySubstitution(using Map(Variable("Y") -> Atom("a")))(Variable("X")) == Variable("X")
+applySubstitution(using Map.empty)(Compound("f", Atom("a"), Atom("b"))) == Compound("f", Atom("a"), Atom("b"))
+applySubstitution(using Map(Variable("X") -> Atom("a"), Variable("Y") -> Atom("c")))
+                 (Compound("f", Variable("X"), Atom("b"), Variable("Y")))   
                   == Compound("f", Atom("a"), Atom("b"), Atom("c"))
-applySubstitution(Compound("f", Variable("X"), Compound("g", Variable("Y"), Atom("b"))), 
-                  Map("X" -> Atom("a"), "Y" -> Atom("c"))) 
+applySubstitution(using Map(Variable("X") -> Atom("a"), Variable("Y") -> Atom("c")))
+                 (Compound("f", Variable("X"), Compound("g", Variable("Y"), Atom("b"))))                    
                   == Compound("f", Atom("a"), Compound("g", Atom("c"), Atom("b")))
-applySubstitution(Compound("parent", Variable("X"), Variable("Y")), 
-                  Map("X" -> Atom("john"), "Y" -> Compound("child", Atom("Alice")))) 
+applySubstitution(using Map(Variable("X") -> Atom("john"), Variable("Y") -> Compound("child", Atom("Alice"))))
+                 (Compound("parent", Variable("X"), Variable("Y")))                  
                   == Compound("parent", Atom("john"), Compound("child", Atom("Alice")))
 
-
-// def search(goals: List[Compound], facts: List[Fact], rules: List[Rule], substitution: Map[String, Term]): LazyList[Map[String, Term]] = {
-//   if (goals.isEmpty) return LazyList(substitution)
-
-//   val (selectedGoal, remainingGoals) = (goals.head, goals.tail)
-
-//   facts.to(LazyList)
-//        .flatMap { fact => unify(selectedGoal, Compound(fact.functor, fact.arguments: _*)) }
-//        .flatMap { unificationResult =>
-//           val newSubstitution = substitution ++ unificationResult
-//           val newGoals = applySubstitutionToGoals(remainingGoals, newSubstitution)
-//           search(newGoals, facts, rules, newSubstitution) 
-//         }
-// }
-
-given Conversion[Fact, Compound] = fact => Compound(fact.functor, fact.arguments: _*)
-
-def search(goals: List[Compound], facts: List[Fact], rules: List[Rule], substitution: Map[String, Term]): LazyList[Map[String, Term]] = {
-  if (goals.isEmpty) return LazyList(substitution)
-
-  val (selectedGoal, remainingGoals) = (goals.head, goals.tail)
-
-  // Unify with facts
-  val factUnifications = facts.to(LazyList).flatMap { fact => unify(selectedGoal, fact) }
-
-  // Unify with rule heads
-  val ruleUnifications = rules.to(LazyList)
-    .flatMap { rule =>
-      unify(selectedGoal, rule.head).map { unificationResult =>
-        (rule, unificationResult)
-      }
-    }
-
-  // Combine fact and rule unifications
-  val combinedUnifications = factUnifications.map((None, _)) ++ ruleUnifications.map(ru => (Some(ru._1), ru._2))
-
-  combinedUnifications.flatMap { case (maybeRule, unificationResult) =>
-    val newSubstitution = substitution ++ unificationResult
-
-    // Apply the substitution to the remaining goals
-    val newGoals = applySubstitutionToGoals(remainingGoals, newSubstitution)
-
-    // If a unifying rule was found, add its body goals to the new goals list
-    maybeRule match {
-      case Some(rule) =>
-        val ruleBodyGoals = rule.body.toList.map(compound => applySubstitutionToCompound(compound, unificationResult).asInstanceOf[Compound])
-        search(newGoals ++ ruleBodyGoals, facts, rules, newSubstitution)
-      case None =>
-        search(newGoals, facts, rules, newSubstitution)
-    }
-  }
-}
-
-def applySubstitutionToCompound(compound: Compound, substitution: Map[String, Term]): Compound = {
-  Compound(compound.functor, compound.arguments.map(arg => applySubstitution(arg, substitution)): _*)
-}
-
-def applySubstitutionToGoals(goals: List[Compound], substitution: Map[String, Term]): List[Compound] = {
-  goals.map { compound => applySubstitutionToCompound(compound, substitution) }
-}
-
-val rules = List(
-  Rule(
-    Compound("grandparent", Variable("X"), Variable("Z")),
-    Compound("parent", Variable("X"), Variable("Y")),
-    Compound("parent", Variable("Y"), Variable("Z"))
+val program = List(
+  Clause.fact("parent", Atom("john"), Atom("alice")),
+  Clause.fact("parent", Atom("jane"), Atom("alice")),
+  Clause.fact("parent", Atom("jane"), Atom("bob")),
+  Clause.fact("parent", Atom("john"), Atom("bob")),
+  Clause.fact("parent", Atom("bob"), Atom("carol")),
+  Clause.fact("parent", Atom("bob"), Atom("david")),
+  Clause.rule(
+    Clause.compound("grandparent", "X", "Z"),
+    Clause.compound("parent", "X", "Y"),
+    Clause.compound("parent", "Y", "Z")
+  ),
+  Clause.rule(
+    Clause.compound("sibling", "X", "Y"),
+    Clause.compound("parent", "Z", "X"),
+    Clause.compound("parent", "Z", "Y"),
+    Clause.compound("not_equal", "X", "Y")
   )
 )
-val facts = List(
-  Fact("parent", Atom("john"), Atom("alice")),
-  Fact("parent", Atom("john"), Atom("bob")),
-  Fact("parent", Atom("jane"), Atom("alice")),
-  Fact("parent", Atom("jane"), Atom("bob")),
-  Fact("parent", Atom("bob"), Atom("carol")),
-  Fact("parent", Atom("bob"), Atom("david"))
-)
 
-search(List(Compound("parent", Variable("G"), Atom("alice"))), facts, rules, Map.empty).drop(1).head
-search(List(Compound("grandparent", Variable("G"), Atom("carol"))), facts, rules, Map.empty).drop(1).head
+query(Clause.compound("parent", "G", "alice"), program).toList
+query(Clause.compound("grandparent", "G", "carol"), program).toList
 
-// == LazyList(Map("G" -> Atom("john")), Map("G" -> Atom("jane")))
-
+query(Clause.compound("sibling", "bob", "Y"), program).toList
